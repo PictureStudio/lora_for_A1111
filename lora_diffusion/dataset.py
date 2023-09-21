@@ -216,7 +216,8 @@ class PivotalTuningDatasetCapation(Dataset):
                         [
                             Image.open(f).convert("RGB")
                             for f in self.instance_images_path
-                        ]
+                        ],
+                        self.blur_amount,
                     )
                     for idx, mask in enumerate(masks):
                         mask.save(f"{instance_data_root}/{idx}.mask.png")
