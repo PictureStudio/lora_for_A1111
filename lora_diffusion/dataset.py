@@ -143,6 +143,7 @@ class PivotalTuningDatasetCapation(Dataset):
         self.resize = resize
         self.train_inpainting = train_inpainting
         self.caption_templates = caption_templates
+        self.blur_amount = blur_amount
 
         instance_data_root = Path(instance_data_root)
         if not instance_data_root.exists():
@@ -254,8 +255,6 @@ class PivotalTuningDatasetCapation(Dataset):
                 transforms.Normalize([0.5], [0.5]),
             ]
         )
-
-        self.blur_amount = blur_amount
 
     def __len__(self):
         return self._length
