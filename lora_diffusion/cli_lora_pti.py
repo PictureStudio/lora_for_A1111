@@ -9,7 +9,6 @@ import math
 import os
 import random
 import re
-import asyncio
 from pathlib import Path
 from typing import Optional, List, Literal
 
@@ -371,7 +370,7 @@ def loss_step(
     return loss
 
 
-def train_inversion(
+async def train_inversion(
     unet,
     vae,
     text_encoder,
@@ -397,8 +396,9 @@ def train_inversion(
     clip_ti_decay: bool = True,
 ):
 
-    #progress_bar = tqdm(range(num_steps))
-    #progress_bar.set_description("Steps")
+    progress_bar = tqdm(range(num_steps))
+    progress_bar.set_description("Steps")
+    
     global_step = 0
 
     # Original Emb for TI
@@ -482,13 +482,15 @@ def train_inversion(
                         #print(f"Current Norm : {current_norm}")
 
                 global_step += 1
-                #progress_bar.update(1)
+                progress_bar.update(1)
+                if callback:
+                    await callback({"TI Steps":global_step/num_steps})
 
                 logs = {
                     "loss": loss.detach().item(),
                     "lr": lr_scheduler.get_last_lr()[0],
                 }
-                #progress_bar.set_postfix(**logs)
+                progress_bar.set_postfix(**logs)
 
             if global_step % save_steps == 0:
                 save_all(
@@ -543,7 +545,7 @@ def train_inversion(
                 return
 
 
-def perform_tuning(
+async def perform_tuning(
     unet,
     vae,
     text_encoder,
@@ -569,8 +571,8 @@ def perform_tuning(
     train_inpainting: bool = False,
 ):
 
-    #progress_bar = tqdm(range(num_steps))
-    #progress_bar.set_description("Steps")
+    progress_bar = tqdm(range(num_steps))
+    progress_bar.set_description("Steps")
     global_step = 0
 
     weight_dtype = torch.float16
@@ -608,12 +610,14 @@ def perform_tuning(
                 itertools.chain(unet.parameters(), text_encoder.parameters()), 1.0
             )
             optimizer.step()
-            #progress_bar.update(1)
+            progress_bar.update(1)
+            if callback:
+                await callback({"LoRa Steps":global_step/num_steps})
             logs = {
                 "loss": loss.detach().item(),
                 "lr": lr_scheduler_lora.get_last_lr()[0],
             }
-            #progress_bar.set_postfix(**logs)
+            progress_bar.set_postfix(**logs)
 
             global_step += 1
 
@@ -694,7 +698,7 @@ def perform_tuning(
     )
 
 
-def train(
+async def train(
     instance_data_dir: str,
     pretrained_model_name_or_path: str,
     output_dir: str,
@@ -908,7 +912,7 @@ def train(
             num_training_steps=max_train_steps_ti,
         )
 
-        train_inversion(
+        await train_inversion(
             unet,
             vae,
             text_encoder,
@@ -932,11 +936,12 @@ def train(
             mixed_precision=False,
             tokenizer=tokenizer,
             clip_ti_decay=clip_ti_decay,
+            callback=None,
         )
 
         del ti_optimizer
     if callback:
-            asyncio.run(callback(50))
+            await(callback(50))
 
     # Next perform Tuning with LoRA:
     if not use_extended_lora:
@@ -1016,7 +1021,7 @@ def train(
         num_training_steps=max_train_steps_tuning,
     )
 
-    perform_tuning(
+    await perform_tuning(
         unet,
         vae,
         text_encoder,
@@ -1040,9 +1045,10 @@ def train(
         wandb_log_prompt_cnt=wandb_log_prompt_cnt,
         class_token=class_token,
         train_inpainting=train_inpainting,
+        callback=None,
     )
     if callback:
-            asyncio.run(callback(100))
+            await callback(100)
     return args
     
 
