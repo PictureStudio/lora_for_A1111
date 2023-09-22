@@ -9,6 +9,7 @@ import math
 import os
 import random
 import re
+import asyncio
 from pathlib import Path
 from typing import Optional, List, Literal
 
@@ -749,7 +750,8 @@ def train(
     proxy_token: str = "person",
     enable_xformers_memory_efficient_attention: bool = False,
     out_name: str = "final_lora",
-    caption_templates: List[str] = []
+    caption_templates: List[str] = [],
+    callback=None
 ):
     args = locals().copy()
     torch.manual_seed(seed)
@@ -933,6 +935,8 @@ def train(
         )
 
         del ti_optimizer
+    if callback:
+            asyncio.run(callback(50))
 
     # Next perform Tuning with LoRA:
     if not use_extended_lora:
@@ -1037,6 +1041,8 @@ def train(
         class_token=class_token,
         train_inpainting=train_inpainting,
     )
+    if callback:
+            asyncio.run(callback(100))
     return args
     
 
