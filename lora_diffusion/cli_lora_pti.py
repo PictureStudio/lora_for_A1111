@@ -394,7 +394,7 @@ async def train_inversion(
     train_inpainting: bool = False,
     mixed_precision: bool = False,
     clip_ti_decay: bool = True,
-    callback=None,
+    on_progress=None,
 ):
 
     progress_bar = tqdm(range(num_steps))
@@ -484,8 +484,8 @@ async def train_inversion(
 
                 global_step += 1
                 progress_bar.update(1)
-                if callback:
-                    await callback({"TI Steps":global_step/num_steps})
+                if on_progress:
+                    await on_progress({"TI Steps":global_step/num_steps})
 
                 logs = {
                     "loss": loss.detach().item(),
@@ -570,7 +570,7 @@ async def perform_tuning(
     wandb_log_prompt_cnt: int = 10,
     class_token: str = "person",
     train_inpainting: bool = False,
-    callback=None,
+    on_progress=None,
 ):
 
     progress_bar = tqdm(range(num_steps))
@@ -613,8 +613,8 @@ async def perform_tuning(
             )
             optimizer.step()
             progress_bar.update(1)
-            if callback:
-                await callback({"LoRa Steps":global_step/num_steps})
+            if on_progress:
+                await on_progress({"LoRa Steps":global_step/num_steps})
             logs = {
                 "loss": loss.detach().item(),
                 "lr": lr_scheduler_lora.get_last_lr()[0],
@@ -757,7 +757,7 @@ async def train(
     enable_xformers_memory_efficient_attention: bool = False,
     out_name: str = "final_lora",
     caption_templates: List[str] = [],
-    callback=None
+    on_progress=None
 ):
     args = locals().copy()
     torch.manual_seed(seed)
@@ -938,12 +938,12 @@ async def train(
             mixed_precision=False,
             tokenizer=tokenizer,
             clip_ti_decay=clip_ti_decay,
-            callback=None,
+            on_progress=on_progress,
         )
 
         del ti_optimizer
-    if callback:
-            await(callback(50))
+    if on_progress:
+            await(on_progress(50))
 
     # Next perform Tuning with LoRA:
     if not use_extended_lora:
@@ -1047,10 +1047,10 @@ async def train(
         wandb_log_prompt_cnt=wandb_log_prompt_cnt,
         class_token=class_token,
         train_inpainting=train_inpainting,
-        callback=None,
+        on_progress=on_progress,
     )
-    if callback:
-            await callback(100)
+    if on_progress:
+            await on_progress(100)
     return args
     
 
