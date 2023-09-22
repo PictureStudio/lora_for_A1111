@@ -394,6 +394,7 @@ async def train_inversion(
     train_inpainting: bool = False,
     mixed_precision: bool = False,
     clip_ti_decay: bool = True,
+    callback=None,
 ):
 
     progress_bar = tqdm(range(num_steps))
@@ -569,6 +570,7 @@ async def perform_tuning(
     wandb_log_prompt_cnt: int = 10,
     class_token: str = "person",
     train_inpainting: bool = False,
+    callback=None,
 ):
 
     progress_bar = tqdm(range(num_steps))
