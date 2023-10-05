@@ -10,16 +10,20 @@ import os
 import random
 import re
 from pathlib import Path
-from typing import Optional, List, Literal
+from typing import List, Literal, Optional
 
+import fire
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.checkpoint
+import wandb
+from accelerate import init_empty_weights
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
     StableDiffusionPipeline,
+    StableDiffusionXLPipeline,
     UNet2DConditionModel,
 )
 from diffusers.optimization import get_scheduler
@@ -29,20 +33,20 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
-import wandb
-import fire
 
 from lora_diffusion import (
+    UNET_EXTENDED_TARGET_REPLACE,
     PivotalTuningDatasetCapation,
+    evaluate_pipe,
     extract_lora_ups_down,
     inject_trainable_lora,
     inject_trainable_lora_extended,
     inspect_lora,
-    save_lora_weight,
-    save_all,
     prepare_clip_model_sets,
-    evaluate_pipe,
-    UNET_EXTENDED_TARGET_REPLACE,
+    save_all,
+    save_lora_weight,
+    sdxl_model_util,
+    sdxl_original_unet,
 )
 
 
@@ -53,71 +57,121 @@ def get_models(
     placeholder_tokens: List[str],
     initializer_tokens: List[str],
     device="cuda:0",
+    weight_dtype=torch.float32,
 ):
+    if pretrained_model_name_or_path.contains("xl"):
+        sdxl = True
+    else:
+        sdxl = False
 
-    tokenizer = CLIPTokenizer.from_pretrained(
-        pretrained_model_name_or_path,
-        subfolder="tokenizer",
-        revision=revision,
-    )
-
-    text_encoder = CLIPTextModel.from_pretrained(
-        pretrained_model_name_or_path,
-        subfolder="text_encoder",
-        revision=revision,
-    )
-
-    placeholder_token_ids = []
-
-    for token, init_tok in zip(placeholder_tokens, initializer_tokens):
-        num_added_tokens = tokenizer.add_tokens(token)
-        if num_added_tokens == 0:
-            raise ValueError(
-                f"The tokenizer already contains the token {token}. Please pass a different"
-                " `placeholder_token` that is not already in the tokenizer."
+    if sdxl:
+        try:
+            pipe = StableDiffusionXLPipeline.from_pretrained(
+                pretrained_model_name_or_path, torch_dtype=weight_dtype, tokenizer=None
             )
-
-        placeholder_token_id = tokenizer.convert_tokens_to_ids(token)
-
-        placeholder_token_ids.append(placeholder_token_id)
-
-        # Load models and create wrapper for stable diffusion
-
-        text_encoder.resize_token_embeddings(len(tokenizer))
-        token_embeds = text_encoder.get_input_embeddings().weight.data
-        if init_tok.startswith("<rand"):
-            # <rand-"sigma">, e.g. <rand-0.5>
-            sigma_val = float(re.findall(r"<rand-(.*)>", init_tok)[0])
-
-            token_embeds[placeholder_token_id] = (
-                torch.randn_like(token_embeds[0]) * sigma_val
+        except EnvironmentError as e:
+            print("try to load fp32 model")
+            pipe = StableDiffusionXLPipeline.from_pretrained(
+                pretrained_model_name_or_path, variant=None, tokenizer=None
             )
-            # print(
-            #     f"Initialized {token} with random noise (sigma={sigma_val}), empirically {token_embeds[placeholder_token_id].mean().item():.3f} +- {token_embeds[placeholder_token_id].std().item():.3f}"
-            # )
-            #print(f"Norm : {token_embeds[placeholder_token_id].norm():.4f}")
+        text_encoder1 = pipe.text_encoder
+        text_encoder2 = pipe.text_encoder_2
 
-        elif init_tok == "<zero>":
-            token_embeds[placeholder_token_id] = torch.zeros_like(token_embeds[0])
-        else:
-            token_ids = tokenizer.encode(init_tok, add_special_tokens=False)
-            # Check if initializer_token is a single token or a sequence of tokens
-            if len(token_ids) > 1:
-                raise ValueError("The initializer token must be a single token.")
+        # convert to fp32 for cache text_encoders outputs
+        if text_encoder1.dtype != torch.float32:
+            text_encoder1 = text_encoder1.to(dtype=torch.float32)
+        if text_encoder2.dtype != torch.float32:
+            text_encoder2 = text_encoder2.to(dtype=torch.float32)
 
-            initializer_token_id = token_ids[0]
-            token_embeds[placeholder_token_id] = token_embeds[initializer_token_id]
+        vae = pipe.vae
+        unet = pipe.unet
+        del pipe
 
-    vae = AutoencoderKL.from_pretrained(
-        pretrained_vae_name_or_path or pretrained_model_name_or_path,
-        subfolder=None if pretrained_vae_name_or_path else "vae",
-        revision=None if pretrained_vae_name_or_path else revision,
-    )
-    unet = UNet2DConditionModel.from_pretrained(
-        pretrained_model_name_or_path,
-        subfolder="unet",
-        revision=revision,
-    )
+        # Diffusers U-Net to original U-Net
+        state_dict = sdxl_model_util.convert_diffusers_unet_state_dict_to_sdxl(
+            unet.state_dict()
+        )
+        with init_empty_weights():
+            unet = sdxl_original_unet.SdxlUNet2DConditionModel()  # overwrite unet
+        sdxl_model_util._load_state_dict_on_device(
+            unet, state_dict, device=device, dtype=weight_dtype
+        )
+        print("U-Net converted to original U-Net")
+        if pretrained_vae_name_or_path is not None:
+            vae = AutoencoderKL.from_pretrained(
+                pretrained_vae_name_or_path or pretrained_model_name_or_path,
+                subfolder=None if pretrained_vae_name_or_path else "vae",
+                revision=None if pretrained_vae_name_or_path else revision,
+                torch_dtype=weight_dtype,
+            )
+            print("additional VAE loaded")
+
+        return text_encoder1, text_encoder2, vae, unet
+
+    else:
+        tokenizer = CLIPTokenizer.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder="tokenizer",
+            revision=revision,
+        )
+
+        text_encoder = CLIPTextModel.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder="text_encoder",
+            revision=revision,
+        )
+
+        placeholder_token_ids = []
+
+        for token, init_tok in zip(placeholder_tokens, initializer_tokens):
+            num_added_tokens = tokenizer.add_tokens(token)
+            if num_added_tokens == 0:
+                raise ValueError(
+                    f"The tokenizer already contains the token {token}. Please pass a different"
+                    " `placeholder_token` that is not already in the tokenizer."
+                )
+
+            placeholder_token_id = tokenizer.convert_tokens_to_ids(token)
+
+            placeholder_token_ids.append(placeholder_token_id)
+
+            # Load models and create wrapper for stable diffusion
+
+            text_encoder.resize_token_embeddings(len(tokenizer))
+            token_embeds = text_encoder.get_input_embeddings().weight.data
+            if init_tok.startswith("<rand"):
+                # <rand-"sigma">, e.g. <rand-0.5>
+                sigma_val = float(re.findall(r"<rand-(.*)>", init_tok)[0])
+
+                token_embeds[placeholder_token_id] = (
+                    torch.randn_like(token_embeds[0]) * sigma_val
+                )
+                # print(
+                #     f"Initialized {token} with random noise (sigma={sigma_val}), empirically {token_embeds[placeholder_token_id].mean().item():.3f} +- {token_embeds[placeholder_token_id].std().item():.3f}"
+                # )
+                # print(f"Norm : {token_embeds[placeholder_token_id].norm():.4f}")
+
+            elif init_tok == "<zero>":
+                token_embeds[placeholder_token_id] = torch.zeros_like(token_embeds[0])
+            else:
+                token_ids = tokenizer.encode(init_tok, add_special_tokens=False)
+                # Check if initializer_token is a single token or a sequence of tokens
+                if len(token_ids) > 1:
+                    raise ValueError("The initializer token must be a single token.")
+
+                initializer_token_id = token_ids[0]
+                token_embeds[placeholder_token_id] = token_embeds[initializer_token_id]
+
+        vae = AutoencoderKL.from_pretrained(
+            pretrained_vae_name_or_path or pretrained_model_name_or_path,
+            subfolder=None if pretrained_vae_name_or_path else "vae",
+            revision=None if pretrained_vae_name_or_path else revision,
+        )
+        unet = UNet2DConditionModel.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder="unet",
+            revision=revision,
+        )
 
     return (
         text_encoder.to(device),
@@ -137,7 +191,6 @@ def text2img_dataloader(
     text_encoder,
     cached_latents: bool = False,
 ):
-
     if cached_latents:
         cached_latents_dataset = []
         for idx in tqdm(range(len(train_dataset))):
@@ -174,7 +227,6 @@ def text2img_dataloader(
         return batch
 
     if cached_latents:
-
         train_dataloader = torch.utils.data.DataLoader(
             cached_latents_dataset,
             batch_size=train_batch_size,
@@ -182,7 +234,7 @@ def text2img_dataloader(
             collate_fn=collate_fn,
         )
 
-        #print("PTI : Using cached latent.")
+        # print("PTI : Using cached latent.")
 
     else:
         train_dataloader = torch.utils.data.DataLoader(
@@ -268,8 +320,8 @@ def loss_step(
     mixed_precision=False,
     mask_temperature=1.0,
     cached_latents: bool = False,
+    weight_dtype=torch.float32,
 ):
-    weight_dtype = torch.float32
     if not cached_latents:
         latents = vae.encode(
             batch["pixel_values"].to(dtype=weight_dtype).to(unet.device)
@@ -314,7 +366,6 @@ def loss_step(
 
     if mixed_precision:
         with torch.cuda.amp.autocast():
-
             encoder_hidden_states = text_encoder(
                 batch["input_ids"].to(text_encoder.device)
             )[0]
@@ -323,7 +374,6 @@ def loss_step(
                 latent_model_input, timesteps, encoder_hidden_states
             ).sample
     else:
-
         encoder_hidden_states = text_encoder(
             batch["input_ids"].to(text_encoder.device)
         )[0]
@@ -338,7 +388,6 @@ def loss_step(
         raise ValueError(f"Unknown prediction type {scheduler.config.prediction_type}")
 
     if batch.get("mask", None) is not None:
-
         mask = (
             batch["mask"]
             .to(model_pred.device)
@@ -395,11 +444,11 @@ async def train_inversion(
     mixed_precision: bool = False,
     clip_ti_decay: bool = True,
     on_progress=None,
+    weight_dtype=torch.float32,
 ):
-
     progress_bar = tqdm(range(num_steps))
     progress_bar.set_description("Steps")
-    
+
     global_step = 0
 
     # Original Emb for TI
@@ -415,7 +464,6 @@ async def train_inversion(
         unet.eval()
         text_encoder.train()
         for batch in dataloader:
-
             lr_scheduler.step()
 
             with torch.set_grad_enabled(True):
@@ -448,7 +496,6 @@ async def train_inversion(
                     optimizer.zero_grad()
 
                     with torch.no_grad():
-
                         # normalize embeddings
                         if clip_ti_decay:
                             pre_norm = (
@@ -468,7 +515,7 @@ async def train_inversion(
                             ) * (
                                 pre_norm + lambda_ * (0.4 - pre_norm)
                             )
-                            #print(pre_norm)
+                            # print(pre_norm)
 
                         current_norm = (
                             text_encoder.get_input_embeddings()
@@ -480,12 +527,12 @@ async def train_inversion(
                             index_no_updates
                         ] = orig_embeds_params[index_no_updates]
 
-                        #print(f"Current Norm : {current_norm}")
+                        # print(f"Current Norm : {current_norm}")
 
                 global_step += 1
                 progress_bar.update(1)
                 if on_progress:
-                    await on_progress({"TI Steps":global_step/num_steps})
+                    await on_progress({"TI Steps": global_step / num_steps})
 
                 logs = {
                     "loss": loss.detach().item(),
@@ -571,13 +618,11 @@ async def perform_tuning(
     class_token: str = "person",
     train_inpainting: bool = False,
     on_progress=None,
+    weight_dtype=torch.float32,
 ):
-
     progress_bar = tqdm(range(num_steps))
     progress_bar.set_description("Steps")
     global_step = 0
-
-    weight_dtype = torch.float16
 
     unet.train()
     text_encoder.train()
@@ -614,7 +659,7 @@ async def perform_tuning(
             optimizer.step()
             progress_bar.update(1)
             if on_progress:
-                await on_progress({"LoRa Steps":global_step/num_steps})
+                await on_progress({"LoRa Steps": global_step / num_steps})
             logs = {
                 "loss": loss.detach().item(),
                 "lr": lr_scheduler_lora.get_last_lr()[0],
@@ -641,7 +686,7 @@ async def perform_tuning(
                     .item()
                 )
 
-                #print("LORA Unet Moved", moved)
+                # print("LORA Unet Moved", moved)
                 moved = (
                     torch.tensor(
                         list(itertools.chain(*inspect_lora(text_encoder).values()))
@@ -650,7 +695,7 @@ async def perform_tuning(
                     .item()
                 )
 
-                #print("LORA CLIP Moved", moved)
+                # print("LORA CLIP Moved", moved)
 
                 if log_wandb:
                     with torch.no_grad():
@@ -757,7 +802,8 @@ async def train(
     enable_xformers_memory_efficient_attention: bool = False,
     out_name: str = "final_lora",
     caption_templates: List[str] = [],
-    on_progress=None
+    on_progress=None,
+    weight_dtype=torch.float32,
 ):
     args = locals().copy()
     torch.manual_seed(seed)
@@ -778,7 +824,7 @@ async def train(
     # print(placeholder_tokens, initializer_tokens)
     if len(placeholder_tokens) == 0:
         placeholder_tokens = []
-        #print("PTI : Placeholder Tokens not given, using null token")
+        # print("PTI : Placeholder Tokens not given, using null token")
     else:
         placeholder_tokens = placeholder_tokens.split("|")
 
@@ -787,7 +833,7 @@ async def train(
         ), f"Placeholder tokens should be sorted. Use something like {'|'.join(sorted(placeholder_tokens))}'"
 
     if initializer_tokens is None:
-        #print("PTI : Initializer Tokens not given, doing random inits")
+        # print("PTI : Initializer Tokens not given, doing random inits")
         initializer_tokens = ["<rand-0.017>"] * len(placeholder_tokens)
     else:
         initializer_tokens = initializer_tokens.split("|")
@@ -807,8 +853,8 @@ async def train(
     else:
         token_map = {"DUMMY": "".join(placeholder_tokens)}
 
-    #print("PTI : Placeholder Tokens", placeholder_tokens)
-    #print("PTI : Initializer Tokens", initializer_tokens)
+    # print("PTI : Placeholder Tokens", placeholder_tokens)
+    # print("PTI : Initializer Tokens", initializer_tokens)
 
     # get the models
     text_encoder, vae, unet, tokenizer, placeholder_token_ids = get_models(
@@ -818,6 +864,7 @@ async def train(
         placeholder_tokens,
         initializer_tokens,
         device=device,
+        weight_dtype=weight_dtype,
     )
 
     noise_scheduler = DDPMScheduler.from_config(
@@ -939,11 +986,12 @@ async def train(
             tokenizer=tokenizer,
             clip_ti_decay=clip_ti_decay,
             on_progress=on_progress,
+            weight_dtype=weight_dtype,
         )
 
         del ti_optimizer
     if on_progress:
-            await(on_progress(50))
+        await on_progress(50)
 
     # Next perform Tuning with LoRA:
     if not use_extended_lora:
@@ -955,18 +1003,18 @@ async def train(
             scale=lora_scale,
         )
     else:
-        #print("PTI : USING EXTENDED UNET!!!")
+        # print("PTI : USING EXTENDED UNET!!!")
         lora_unet_target_modules = (
             lora_unet_target_modules | UNET_EXTENDED_TARGET_REPLACE
         )
-        #print("PTI : Will replace modules: ", lora_unet_target_modules)
+        # print("PTI : Will replace modules: ", lora_unet_target_modules)
 
         unet_lora_params, _ = inject_trainable_lora_extended(
             unet, r=lora_rank, target_replace_module=lora_unet_target_modules
         )
-    #print(f"PTI : has {len(unet_lora_params)} lora")
+    # print(f"PTI : has {len(unet_lora_params)} lora")
 
-    #print("PTI : Before training:")
+    # print("PTI : Before training:")
     inspect_lora(unet)
 
     params_to_optimize = [
@@ -1048,11 +1096,11 @@ async def train(
         class_token=class_token,
         train_inpainting=train_inpainting,
         on_progress=on_progress,
+        weight_dtype=weight_dtype,
     )
     if on_progress:
-            await on_progress(100)
+        await on_progress(100)
     return args
-    
 
 
 def main():
