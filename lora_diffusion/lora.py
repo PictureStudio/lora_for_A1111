@@ -28,7 +28,6 @@ except ImportError:
 
     safetensors_available = False
 
-
 class LoraInjectedLinear(nn.Module):
     def __init__(
         self, in_features, out_features, bias=False, r=4, dropout_p=0.1, scale=1.0
@@ -1063,6 +1062,7 @@ def save_all(
 
         # save text encoder
         if save_lora:
+
             save_lora_weight(
                 unet, save_path, target_replace_module=target_replace_module_unet
             )
@@ -1099,7 +1099,9 @@ def save_all(
                 )
                 embeds[tok] = learned_embeds.detach().cpu()
 
-        save_safeloras_for_webui(loras, embeds, save_path)
+        save_safeloras_for_webui(
+            loras, embeds, save_path
+        )
 
 
 def extract_lora_tensor(
@@ -1167,13 +1169,17 @@ def save_safeloras_for_webui(
             )
         weights.update(weights_tmp)
 
-    for idx, (token, tensor) in enumerate(embeds.items()):
-        # saving the TI embedding to seperate file
-        safe_save(
-            {token: tensor},
-            outpath.replace(".safetensors", f"_{idx}_ti.safetensors"),
-            {token: EMBED_FLAG},
-        )
+    metadata_embeds = {}
+    weights_embeds = {}
+    for token, tensor in embeds.items():
+        metadata_embeds[token] = EMBED_FLAG
+        weights_embeds[token] = tensor
+    # saving the TI embedding to seperate file
+    safe_save(
+        weights_embeds,
+        outpath.replace(".safetensors", "_ti.safetensors"),
+        metadata_embeds,
+    )
 
-    # print(f"Saving weights to {outpath}")
+    print(f"Saving weights to {outpath}")
     safe_save(weights, outpath, metadata)
