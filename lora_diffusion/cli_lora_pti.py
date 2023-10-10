@@ -943,8 +943,6 @@ async def train(
         )
 
         del ti_optimizer
-    if on_progress:
-            await(on_progress(50))
 
     # Next perform Tuning with LoRA:
     if not use_extended_lora:
@@ -1050,8 +1048,6 @@ async def train(
         train_inpainting=train_inpainting,
         on_progress=on_progress,
     )
-    if on_progress:
-            await on_progress(100)
     return args
     
 
