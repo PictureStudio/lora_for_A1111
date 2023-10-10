@@ -485,7 +485,7 @@ async def train_inversion(
                 global_step += 1
                 progress_bar.update(1)
                 if on_progress:
-                    await on_progress({"TI Steps":global_step/num_steps})
+                    await on_progress({"TI Steps":global_step, "progress": int(global_step*50/num_steps), "stage":"TI"})
 
                 logs = {
                     "loss": loss.detach().item(),
@@ -613,8 +613,7 @@ async def perform_tuning(
             )
             optimizer.step()
             progress_bar.update(1)
-            if on_progress:
-                await on_progress({"LoRa Steps":global_step/num_steps})
+           
             logs = {
                 "loss": loss.detach().item(),
                 "lr": lr_scheduler_lora.get_last_lr()[0],
@@ -622,8 +621,10 @@ async def perform_tuning(
             progress_bar.set_postfix(**logs)
 
             global_step += 1
+            if on_progress:
+                await on_progress({"LoRa Steps":global_step, "progress": int(50+(global_step*50/num_steps)), "stage":"Tuning"})
 
-            if global_step % save_steps == 0:
+        if global_step % save_steps == 0:
                 save_all(
                     unet,
                     text_encoder,
