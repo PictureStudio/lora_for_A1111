@@ -484,7 +484,7 @@ async def train_inversion(
 
                 global_step += 1
                 progress_bar.update(1)
-                if on_progress and ((global_step*50)/num_steps).is_integer():
+                if on_progress and (((global_step*50)/num_steps)%1==0):
                     await on_progress({"TI Steps":global_step, "progress": global_step*50//num_steps, "stage":"TI"})
 
                 logs = {
@@ -621,7 +621,7 @@ async def perform_tuning(
             progress_bar.set_postfix(**logs)
 
             global_step += 1
-            if on_progress and ((global_step*50)/num_steps).is_integer():
+            if on_progress and (((global_step*50)/num_steps)%1==0):
                 await on_progress({"LoRa Steps":global_step, "progress": (50+(global_step*50//num_steps)), "stage":"Tuning"})
 
             if global_step % save_steps == 0:
