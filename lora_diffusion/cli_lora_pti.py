@@ -624,7 +624,7 @@ async def perform_tuning(
             if on_progress and ((global_step*50)/num_steps).is_integer():
                 await on_progress({"LoRa Steps":global_step, "progress": (50+(global_step*50//num_steps)), "stage":"Tuning"})
 
-        if global_step % save_steps == 0:
+            if global_step % save_steps == 0:
                 save_all(
                     unet,
                     text_encoder,
